@@ -25,7 +25,7 @@ Workflow:
 import os
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -67,6 +67,11 @@ class MainWindow(QMainWindow):
         self.current_index: int = -1
         self.current_frames: list[np.ndarray] = []  # raw (unlabeled) frames of the selection
 
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self._advance_playback)
+        self.is_playing = False
+        self.playback_fps = 10  # default; overridden per-file when known (see on_file_selected)
+
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
@@ -100,11 +105,25 @@ class MainWindow(QMainWindow):
         self.image_label.setMinimumSize(640, 480)
         right_panel.addWidget(self.image_label, stretch=1)
 
-        # frame scrubber (for multi-frame DICOM / video)
+        # frame scrubber + playback (for multi-frame DICOM / video)
+        playback_row = QHBoxLayout()
+
+        self.play_btn = QPushButton("▶ Play")
+        self.play_btn.setEnabled(False)
+        self.play_btn.clicked.connect(self.toggle_playback)
+        playback_row.addWidget(self.play_btn)
+
         self.frame_slider = QSlider(Qt.Horizontal)
         self.frame_slider.setEnabled(False)
         self.frame_slider.valueChanged.connect(self.on_frame_slider_changed)
-        right_panel.addWidget(self.frame_slider)
+        playback_row.addWidget(self.frame_slider, stretch=1)
+
+        self.frame_counter_label = QLabel("")
+        self.frame_counter_label.setMinimumWidth(60)
+        self.frame_counter_label.setAlignment(Qt.AlignCenter)
+        playback_row.addWidget(self.frame_counter_label)
+
+        right_panel.addLayout(playback_row)
 
         # current label readout
         self.label_display = QLabel("No file loaded")
@@ -173,6 +192,8 @@ class MainWindow(QMainWindow):
         return f"{tag} [{mf.kind}] {name}"
 
     def on_file_selected(self, row: int):
+        self._stop_playback()
+
         if row < 0 or row >= len(self.media_files):
             return
         self.current_index = row
@@ -182,17 +203,29 @@ class MainWindow(QMainWindow):
             if mf.kind == "dicom":
                 ds = dicom_utils.load_dicom(mf.path)
                 self.current_frames = dicom_utils.get_frames_as_uint8(ds)
+                # Use the DICOM's own cine rate when available (CineRate, or
+                # FrameTime in ms/frame), otherwise fall back to the default.
+                fps = getattr(ds, "CineRate", None)
+                if not fps and getattr(ds, "FrameTime", None):
+                    frame_time_ms = float(ds.FrameTime)
+                    fps = 1000.0 / frame_time_ms if frame_time_ms > 0 else None
+                self.playback_fps = float(fps) if fps else 10.0
             else:
                 self.current_frames = video_utils.read_frames(mf.path)
+                self.playback_fps = video_utils.get_fps(mf.path) or 10.0
         except Exception as exc:
             QMessageBox.warning(self, "Failed to load file", f"{mf.path}\n\n{exc}")
             self.current_frames = []
+            self.playback_fps = 10.0
 
         n_frames = len(self.current_frames)
-        self.frame_slider.setEnabled(n_frames > 1)
+        multi_frame = n_frames > 1
+        self.frame_slider.setEnabled(multi_frame)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(max(0, n_frames - 1))
         self.frame_slider.setValue(0)
+        self.play_btn.setEnabled(multi_frame)
+        self.play_btn.setText("▶ Play")
 
         self._render_frame(0)
         self._update_label_display(mf)
@@ -202,9 +235,38 @@ class MainWindow(QMainWindow):
     def on_frame_slider_changed(self, value: int):
         self._render_frame(value)
 
+    def toggle_playback(self):
+        if self.is_playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self):
+        if len(self.current_frames) <= 1:
+            return
+        self.is_playing = True
+        self.play_btn.setText("⏸ Pause")
+        interval_ms = max(1, int(1000 / self.playback_fps))
+        self.playback_timer.start(interval_ms)
+
+    def _stop_playback(self):
+        self.is_playing = False
+        self.playback_timer.stop()
+        self.play_btn.setText("▶ Play")
+
+    def _advance_playback(self):
+        if not self.current_frames:
+            self._stop_playback()
+            return
+        next_index = self.frame_slider.value() + 1
+        if next_index > self.frame_slider.maximum():
+            next_index = 0  # loop back to the start of the cine/video
+        self.frame_slider.setValue(next_index)  # triggers on_frame_slider_changed -> _render_frame
+
     def _render_frame(self, index: int):
         if not self.current_frames:
             self.image_label.setText("Could not load preview")
+            self.frame_counter_label.setText("")
             return
         index = max(0, min(index, len(self.current_frames) - 1))
         pixmap = np_frame_to_qpixmap(self.current_frames[index])
@@ -212,6 +274,7 @@ class MainWindow(QMainWindow):
             self.image_label.width(), self.image_label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.image_label.setPixmap(scaled)
+        self.frame_counter_label.setText(f"{index + 1} / {len(self.current_frames)}")
 
     def _update_label_display(self, mf: MediaFile):
         if mf.label:
@@ -230,6 +293,8 @@ class MainWindow(QMainWindow):
         label = self.label_input.text().strip()
         if not label:
             return
+
+        self._stop_playback()
 
         try:
             if mf.kind == "dicom":
